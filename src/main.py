@@ -1,176 +1,160 @@
 import os
+import logging
+import time
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import torchvision.transforms as transforms
-import glob
-import random
-import warnings
+
+from monai.data import decollate_batch
+from monai.inferers import SlidingWindowInferer
+from monai.losses import DiceCELoss
+from monai.metrics import DiceMetric, MeanIoU
+from monai.networks.nets import DynUNet
+from monai.transforms import AsDiscrete
+from monai.utils import set_determinism
 
 import config
-from data_loader import HepaticVesselDataset
-from models.unet_model import UNet
-
+from data_loader import get_data_loaders
+from plot_utils import save_plots
 
 def main():
-    print("--- Loading Configuration ---")
-    print(f"Data directory: {config.DATA_DIR}")
-    print(f"Train/Val/Test Split: {config.TRAIN_RATIO*100}% / {config.VAL_RATIO*100}% / {config.TEST_RATIO*100}%")
-    print(f"Patch Size: {config.PATCH_SIZE}")
+    logging.basicConfig(level=logging.INFO)
+    set_determinism(seed=config.SEED)
+    os.makedirs(config.RUN_DIR, exist_ok=True)
 
-    print("\n--- Preparing Data and Performing Split ---")
+    logging.info(f"Using device: {config.DEVICE}")
 
-    all_image_paths = sorted(glob.glob(os.path.join(config.RAW_TRAIN_IMAGES_DIR, '*.nii.gz')))
-    
-    if not all_image_paths:
-        raise FileNotFoundError(f"No image files found in {config.RAW_TRAIN_IMAGES_DIR}. Please check DATA_DIR in config.py.")
+    train_loader, val_loader, _ = get_data_loaders()
 
-    data_tuples = []
-    for img_path in all_image_paths:
-        base_name = os.path.basename(img_path)
-        lbl_path = os.path.join(config.RAW_TRAIN_LABELS_DIR, base_name)
-        roi_path = os.path.join(config.LIVER_ROI_MASKS_DIR, base_name)
+    logging.info("--- Initializing Model, Loss, and Optimizer ---")
 
-        if os.path.exists(lbl_path) and os.path.exists(roi_path):
-            data_tuples.append((img_path, lbl_path, roi_path))
-        else:
-            warnings.warn(f"Missing files for {base_name}. Skipping volume.")
-            print(f"  Image: {img_path} ({os.path.exists(img_path)})")
-            print(f"  Label: {lbl_path} ({os.path.exists(lbl_path)})")
-            print(f"  ROI:   {roi_path} ({os.path.exists(roi_path)})")
-    
-    if not data_tuples:
-        raise ValueError("No complete image-label-ROI triplets found after checking. Cannot proceed with data splitting. Ensure all files exist or generate ROI masks.")
+    model = DynUNet(
+        spatial_dims=3, in_channels=1, out_channels=2,
+        kernel_size=config.KERNELS, strides=config.STRIDES,
+        upsample_kernel_size=config.STRIDES[1:],
+        norm_name="instance", res_block=True,
+    ).to(config.DEVICE)
 
-    print(f"Found {len(data_tuples)} complete volumes for splitting.")
-    random.seed(42)
-    random.shuffle(data_tuples)
+    loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
+    optimizer = torch.optim.Adam(model.parameters(), config.LEARNING_RATE)
 
-    total_volumes = len(data_tuples)
-    train_size = int(total_volumes * config.TRAIN_RATIO)
-    val_size = int(total_volumes * config.VAL_RATIO)
-    test_size = total_volumes - train_size - val_size
+    start_epoch = 0
+    best_metric = -1
+    best_metric_epoch = -1
+    epoch_loss_values = []
+    metric_values = []
+    iou_values = []
 
-    train_data = data_tuples[0:train_size]
-    val_data = data_tuples[train_size:train_size + val_size]
-    test_data = data_tuples[train_size + val_size:]
+    if os.path.exists(config.CHECKPOINT_PATH):
+        logging.info(f"--- Loading checkpoint from {config.CHECKPOINT_PATH} ---")
+        checkpoint = torch.load(config.CHECKPOINT_PATH, map_location=config.DEVICE)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"]
+        best_metric = checkpoint["best_metric"]
+        best_metric_epoch = checkpoint["best_metric_epoch"]
+        epoch_loss_values = checkpoint["epoch_loss_values"]
+        metric_values = checkpoint["metric_values"]
+        iou_values = checkpoint["iou_values"]
+        logging.info(f"--- Resuming training from epoch {start_epoch} ---")
+    else:
+        logging.info("--- No checkpoint found, starting from scratch ---")
 
-    print(f"Train volumes: {len(train_data)}, Validation volumes: {len(val_data)}, Test volumes: {len(test_data)}")
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    iou_metric = MeanIoU(include_background=False, reduction="mean")
 
-    train_img_paths, train_lbl_paths, train_roi_paths = zip(*train_data) if train_data else ([], [], [])
-    val_img_paths, val_lbl_paths, val_roi_paths = zip(*val_data) if val_data else ([], [], [])
-    test_img_paths, test_lbl_paths, test_roi_paths = zip(*test_data) if test_data else ([], [], [])
+    post_pred = AsDiscrete(argmax=True, to_onehot=2)
+    post_label = AsDiscrete(to_onehot=2)
 
-    print("\n--- Defining Data Transforms (Augmentations only) ---")
-    
-    train_dataset = HepaticVesselDataset(
-        image_paths=list(train_img_paths),
-        label_paths=list(train_lbl_paths),
-        roi_paths=list(train_roi_paths)
+    val_inferer = SlidingWindowInferer(
+        roi_size=config.INFERER_ROI_SIZE,
+        sw_batch_size=config.INFERER_SW_BATCH_SIZE,
+        overlap=config.INFERER_OVERLAP,
     )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=True
-    )
-    print(f"Train DataLoader created with {len(train_dataset)} slices and batch size {config.BATCH_SIZE}.")
 
-    val_dataset = HepaticVesselDataset(
-        image_paths=list(val_img_paths),
-        label_paths=list(val_lbl_paths),
-        roi_paths=list(val_roi_paths)
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=True
-    )
-    print(f"Validation DataLoader created with {len(val_dataset)} slices and batch size {config.BATCH_SIZE}.")
+    logging.info("--- Starting Training ---")
 
-    test_dataset = HepaticVesselDataset(
-        image_paths=list(test_img_paths),
-        label_paths=list(test_lbl_paths),
-        roi_paths=list(test_roi_paths)
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=True
-    )
-    print(f"Test DataLoader created with {len(test_dataset)} slices and batch size {config.BATCH_SIZE}.")
+    for epoch in range(start_epoch, config.MAX_EPOCHS):
+        epoch_start_time = time.time()
+        logging.info(f"Epoch {epoch + 1}/{config.MAX_EPOCHS}")
 
-
-    print("\n--- Initializing Model ---")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    model = UNet(in_channels=config.IN_CHANNELS, out_channels=config.OUT_CHANNELS).to(device)
-    print("Model initialized (UNet).")
-    print(f"Model will run on: {device}")
-
-
-    print("\n--- Defining Loss Function and Optimizer ---")
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
-    print(f"Loss function (BCEWithLogitsLoss) and Optimizer (Adam with LR={config.LEARNING_RATE}) defined.")
-
-
-    print("\n--- Starting Training Loop ---")
-    
-    best_val_loss = float('inf')
-
-    for epoch in range(config.NUM_EPOCHS):
-        print(f"\nEpoch {epoch+1}/{config.NUM_EPOCHS}")
-        
         model.train()
-        running_loss = 0.0
-
-        for batch_idx, (images, masks) in enumerate(train_loader):
-            images = images.to(device)
-            masks = masks.to(device)
-
-            outputs = model(images)
-            loss = criterion(outputs, masks)
-
+        epoch_loss = 0
+        for step, batch_data in enumerate(train_loader):
+            inputs, labels = (
+                batch_data["image"].to(config.DEVICE),
+                batch_data["label"].to(config.DEVICE),
+            )
             optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = loss_function(outputs, labels)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+            print(f"  {step+1}/{len(train_loader)}, Train_loss: {loss.item():.4f}", end='\r')
 
-            running_loss += loss.item() * images.size(0)
+        epoch_loss /= (step + 1)
+        epoch_loss_values.append(epoch_loss)
+        logging.info(f"Epoch {epoch + 1} average loss: {epoch_loss:.4f}")
 
-            if batch_idx % 10 == 0:
-                print(f"  Batch {batch_idx+1}/{len(train_loader)}, Loss: {loss.item():.4f}")
-            
-        epoch_loss = running_loss / len(train_dataset)
-        print(f"Epoch {epoch+1} Training finished. Avg Loss: {epoch_loss:.4f}")
-
-        if len(val_dataset) > 0:
+        if (epoch + 1) % config.VAL_INTERVAL == 0:
             model.eval()
-            val_running_loss = 0.0
             with torch.no_grad():
-                for val_images, val_masks in val_loader:
-                    val_images = val_images.to(device)
-                    val_masks = val_masks.to(device)
-                    val_outputs = model(val_images)
-                    val_loss = criterion(val_outputs, val_masks)
-                    val_running_loss += val_loss.item() * val_images.size(0)
-            
-            val_epoch_loss = val_running_loss / len(val_dataset)
-            print(f"Epoch {epoch+1} Validation Loss: {val_epoch_loss:.4f}")
+                for val_data in val_loader:
+                    val_inputs = val_data["image"].to(config.DEVICE)
+                    val_labels = val_data["label"].to(config.DEVICE)
+                    val_outputs = val_inferer(val_inputs, model)
 
-            if val_epoch_loss < best_val_loss:
-                best_val_loss = val_epoch_loss
-                model_save_path = os.path.join(config.SAVE_DIR, 'best_model.pth')
-                torch.save(model.state_dict(), model_save_path)
-                print(f"  Saved best model to {model_save_path} (Validation Loss: {best_val_loss:.4f})")
+                    val_outputs_list = decollate_batch(val_outputs)
+                    val_labels_list = decollate_batch(val_labels)
 
-    print("\n--- Training Loop Finished ---")
+                    val_output_converted = [post_pred(p) for p in val_outputs_list]
+                    val_label_converted = [post_label(l) for l in val_labels_list]
 
-if __name__ == '__main__':
+                    dice_metric(y_pred=val_output_converted, y=val_label_converted)
+                    iou_metric(y_pred=val_output_converted, y=val_label_converted)
+
+                mean_dice = dice_metric.aggregate().item()
+                mean_iou = iou_metric.aggregate().item()
+                dice_metric.reset()
+                iou_metric.reset()
+
+                metric_values.append(mean_dice)
+                iou_values.append(mean_iou)
+
+                if mean_dice > best_metric:
+                    best_metric = mean_dice
+                    best_metric_epoch = epoch + 1
+                    torch.save(model.state_dict(), config.BEST_MODEL_PATH)
+                    logging.info("Saved new best metric model")
+
+                logging.info(
+                    f"Current epoch: {epoch + 1}, "
+                    f"Current mean dice: {mean_dice:.4f}, "
+                    f"Current mean IoU: {mean_iou:.4f}"
+                )
+                logging.info(
+                    f"Best mean dice: {best_metric:.4f} at epoch: {best_metric_epoch}"
+                )
+
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_metric': best_metric,
+                    'best_metric_epoch': best_metric_epoch,
+                    'epoch_loss_values': epoch_loss_values,
+                    'metric_values': metric_values,
+                    'iou_values': iou_values,
+                }, config.CHECKPOINT_PATH)
+                logging.info(f"Saved checkpoint to {config.CHECKPOINT_PATH}")
+
+        logging.info(f"Time for epoch {epoch + 1}: {time.time() - epoch_start_time:.2f}s")
+
+    logging.info("--- Training Finished ---")
+    logging.info(f"Final best Dice: {best_metric:.4f} at epoch {best_metric_epoch}")
+
+    logging.info(f"Saving plots to {config.PLOT_DIR}")
+    save_plots(epoch_loss_values, metric_values, iou_values, config.VAL_INTERVAL, config.PLOT_DIR)
+    logging.info("--- All tasks complete ---")
+
+if __name__ == "__main__":
     main()

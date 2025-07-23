@@ -1,37 +1,39 @@
 import os
+import torch
 
-DATA_DIR = 'D:/monai-project/vessel_seg/data/Task08_HepaticVessel/'
+SEED = 42
 
-RAW_TRAIN_IMAGES_DIR = os.path.join(DATA_DIR, 'imagesTr/')
-RAW_TRAIN_LABELS_DIR = os.path.join(DATA_DIR, 'labelsTr/')
+DATA_DIR = "D:/monai-project/vessel_seg/data/Task08_HepaticVessel"
+RUN_DIR = "D:/monai-project/vessel_seg/runs/vessel_segmentation_run_1"
+CACHE_DIR = os.path.join(RUN_DIR, "dataset_cache")
 
-LIVER_ROI_MASKS_DIR = os.path.join(DATA_DIR, 'liver_roi_masks/')
-os.makedirs(LIVER_ROI_MASKS_DIR, exist_ok=True)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+PATCH_SIZE = (96, 96, 96)
 
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
-TEST_RATIO = 0.1
 
-ISOTROPIC_RESOLUTION = (1.5, 1.5, 1.5)
-PATCH_SIZE = (128, 128)
+BATCH_SIZE = 1
+NUM_WORKERS = 1
 
-FRANGI_SCALES = (4, 8)
-FRANGI_ALPHA = 0.5
-FRANGI_BETA = 0.5
-FRANGI_BLACK_RIDGES = True
+PIXDIM = (1.5, 1.5, 2.0)
 
-CED_ITERATIONS = 10
-CED_K_PARAM = 0.03
-CED_LAMBDA_PARAM = 0.05
-CED_OPTION = 1
+A_MIN = -175.0
+A_MAX = 250.0
+B_MIN = 0.0
+B_MAX = 1.0
 
-BATCH_SIZE = 2
-NUM_WORKERS = 0
-NUM_EPOCHS = 5
+MAX_EPOCHS = 30
+VAL_INTERVAL = 5
+
 LEARNING_RATE = 1e-4
 
-IN_CHANNELS = 1
-OUT_CHANNELS = 1
+KERNELS = [[3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3]]
+STRIDES = [[1, 1, 1], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2]]
 
-SAVE_DIR = os.path.join(os.getcwd(), 'runs')
-os.makedirs(SAVE_DIR, exist_ok=True)
+INFERER_ROI_SIZE = PATCH_SIZE
+INFERER_SW_BATCH_SIZE = 4
+INFERER_OVERLAP = 0.5
+
+MODEL_PATH = os.path.join(RUN_DIR, "best_metric_model.pth")

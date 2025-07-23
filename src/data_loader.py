@@ -1,137 +1,113 @@
 import os
 import glob
-import SimpleITK as sitk
+import logging
 import numpy as np
-import torch
-from torch.utils.data import Dataset
-import torchvision.transforms as transforms
-import random
-import warnings
+
+from monai.data import CacheDataset, Dataset, DataLoader, list_data_collate
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirstd,
+    EnsureTyped,
+    LoadImaged,
+    Orientationd,
+    RandCropByPosNegLabeld,
+    RandFlipd,
+    RandRotate90d,
+    RandShiftIntensityd,
+    ScaleIntensityRanged,
+    Spacingd,
+)
 
 import config
-from preprocessing import ApplyFrangiVesselness, ApplyCEDFilter
 
+def get_transforms(mode="train"):
+    shared_transforms = [
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        Spacingd(
+            keys=["image", "label"],
+            pixdim=config.PIXDIM,
+            mode=("bilinear", "nearest"),
+        ),
+        ScaleIntensityRanged(
+            keys=["image"],
+            a_min=config.A_MIN,
+            a_max=config.A_MAX,
+            b_min=config.B_MIN,
+            b_max=config.B_MAX,
+            clip=True,
+        ),
+    ]
 
-class HepaticVesselDataset(Dataset):
-    def __init__(self, image_paths, label_paths, roi_paths):
-        self.image_paths = image_paths
-        self.label_paths = label_paths
-        self.roi_paths = roi_paths
-        self.data_tuples = []
-        self.preprocess_volumes()
-
-
-    def preprocess_volumes(self):
-        print(f"Loading and pre-processing {len(self.image_paths)} volumes for slices...")
-        temp_data_tuples = []
-
-        frangi = ApplyFrangiVesselness(
-            sigmas=config.FRANGI_SCALES,
-            alpha=config.FRANGI_ALPHA,
-            beta=config.FRANGI_BETA,
-            black_ridges=config.FRANGI_BLACK_RIDGES
+    if mode == "train":
+        return Compose(
+            shared_transforms + [
+                RandCropByPosNegLabeld(
+                    keys=["image", "label"],
+                    label_key="label",
+                    spatial_size=config.PATCH_SIZE,
+                    pos=1, neg=1, num_samples=4,
+                    image_key="image", image_threshold=0,
+                ),
+                RandFlipd(keys=["image", "label"], spatial_axis=[0], prob=0.5),
+                RandFlipd(keys=["image", "label"], spatial_axis=[1], prob=0.5),
+                RandFlipd(keys=["image", "label"], spatial_axis=[2], prob=0.5),
+                RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
+                RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
+                EnsureTyped(keys=["image", "label"]),
+            ]
         )
-        ced = ApplyCEDFilter(
-            iterations=config.CED_ITERATIONS,
-            K=config.CED_K_PARAM,
-            lambda_param=config.CED_LAMBDA_PARAM,
-            option=config.CED_OPTION
-        )
-
-        for i, (image_path, label_path, roi_path) in enumerate(zip(self.image_paths, self.label_paths, self.roi_paths)):
-            try:
-                image_itk = sitk.ReadImage(image_path)
-                label_itk = sitk.ReadImage(label_path)
-                roi_itk = sitk.ReadImage(roi_path)
-
-                resample_image = sitk.ResampleImageFilter()
-                resample_image.SetOutputSpacing(config.ISOTROPIC_RESOLUTION)
-                resample_image.SetInterpolator(sitk.sitkLinear)
-                resample_image.SetOutputOrigin(image_itk.GetOrigin())
-                resample_image.SetOutputDirection(image_itk.GetDirection())
-                resample_image.SetReferenceImage(image_itk)
-                image_resampled = resample_image.Execute(image_itk)
-                output_size = image_resampled.GetSize()
-
-                resample_mask = sitk.ResampleImageFilter()
-                resample_mask.SetOutputSpacing(config.ISOTROPIC_RESOLUTION)
-                resample_mask.SetInterpolator(sitk.sitkNearestNeighbor)
-                resample_mask.SetOutputOrigin(label_itk.GetOrigin())
-                resample_mask.SetOutputDirection(label_itk.GetDirection())
-                resample_mask.SetSize(output_size)
-                resample_mask.SetReferenceImage(label_itk)
-                
-                label_resampled = resample_mask.Execute(label_itk)
-                roi_resampled = resample_mask.Execute(roi_itk)
-
-                image_array = sitk.GetArrayFromImage(image_resampled)
-                label_array = sitk.GetArrayFromImage(label_resampled)
-                roi_array = sitk.GetArrayFromImage(roi_resampled)
-
-                valid_z_indices = np.where(roi_array.sum(axis=(1, 2)) > 0)[0]
-
-                for z in valid_z_indices:
-                    img_slice = image_array[z, :, :]
-                    lbl_slice = label_array[z, :, :]
-                    roi_slice = roi_array[z, :, :]
-
-                    lbl_slice = lbl_slice * roi_slice
-
-                    min_hu = -100.0
-                    max_hu = 400.0
-                    img_slice_norm = np.clip(img_slice, min_hu, max_hu)
-                    img_slice_norm = (img_slice_norm - min_hu) / (max_hu - min_hu)
-                    
-                    original_img_tensor_chw = torch.from_numpy(img_slice_norm).float().unsqueeze(0)
-
-                    frangi_output_tensor = frangi(original_img_tensor_chw)
-                    ced_output_tensor = ced(original_img_tensor_chw)
-
-                    combined_input_tensor = (original_img_tensor_chw + frangi_output_tensor + ced_output_tensor) / 3.0
-                    combined_input_tensor = torch.clamp(combined_input_tensor, 0, 1)
-
-                    lbl_tensor = torch.from_numpy(lbl_slice).float().unsqueeze(0)
-                    
-                    H, W = config.PATCH_SIZE
-                    _, current_H, current_W = combined_input_tensor.shape
-
-                    pad_H, pad_W = 0, 0
-                    if current_H < H:
-                        pad_H = H - current_H
-                    if current_W < W:
-                        pad_W = W - current_W
-                    
-                    if pad_H > 0 or pad_W > 0:
-                        pad_left = pad_W // 2
-                        pad_right = pad_W - pad_left
-                        pad_top = pad_H // 2
-                        pad_bottom = pad_H - pad_top
-                        
-                        padding_transform = transforms.Pad((pad_left, pad_top, pad_right, pad_bottom), fill=0)
-                        combined_input_tensor = padding_transform(combined_input_tensor)
-                        lbl_tensor = padding_transform(lbl_tensor)
-                        _, current_H, current_W = combined_input_tensor.shape
-
-                    if current_H > H or current_W > W:
-                        crop_transform = transforms.CenterCrop(config.PATCH_SIZE)
-                        combined_input_tensor = crop_transform(combined_input_tensor)
-                        lbl_tensor = crop_transform(lbl_tensor)
-                    
-                    temp_data_tuples.append((combined_input_tensor, lbl_tensor))
-            
-            except Exception as e:
-                warnings.warn(f"Error processing volume {os.path.basename(image_path)}: {e}. Skipping this volume.")
-
-        self.data_tuples = temp_data_tuples
-        print(f"Finished pre-processing. Total 2D slices for this dataset: {len(self.data_tuples)}")
-        
-        if len(self.data_tuples) == 0:
-            warnings.warn("No 2D slices were extracted for this dataset. Dataset will be empty.")
+    elif mode == "val":
+        return Compose(shared_transforms + [EnsureTyped(keys=["image", "label"])])
+    else:
+        raise ValueError(f"Invalid transform mode: {mode}")
 
 
-    def __len__(self):
-        return len(self.data_tuples)
+def get_data_loaders():
+    logging.info("--- Preparing Data ---")
 
-    def __getitem__(self, idx):
-        image_slice, label_slice = self.data_tuples[idx]
-        return image_slice, label_slice
+    train_images = sorted(glob.glob(os.path.join(config.DATA_DIR, "imagesTr", "*.nii.gz")))
+    train_labels = sorted(glob.glob(os.path.join(config.DATA_DIR, "labelsTr", "*.nii.gz")))
+
+    data_dicts = [
+        {"image": image_name, "label": label_name}
+        for image_name, label_name in zip(train_images, train_labels)
+    ]
+    logging.info(f"Found {len(data_dicts)} subjects.")
+
+    np.random.seed(config.SEED)
+    np.random.shuffle(data_dicts)
+
+    num_total = len(data_dicts)
+    num_train = int(num_total * config.TRAIN_RATIO)
+    num_val = int(num_total * config.VAL_RATIO)
+
+    train_files = data_dicts[:num_train]
+    val_files = data_dicts[num_train : num_train + num_val]
+    test_files = data_dicts[num_train + num_val :]
+
+    logging.info(f"Training samples: {len(train_files)}")
+    logging.info(f"Validation samples: {len(val_files)}")
+    logging.info(f"Testing samples: {len(test_files)}")
+
+    logging.info("--- Creating Datasets and DataLoaders ---")
+
+    train_transforms = get_transforms(mode="train")
+    val_transforms = get_transforms(mode="val")
+
+    train_ds = CacheDataset(
+        data=train_files, transform=train_transforms,
+        cache_rate=1.0, num_workers=config.NUM_WORKERS
+    )
+    val_ds = Dataset(data=val_files, transform=val_transforms)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=config.BATCH_SIZE, shuffle=True,
+        num_workers=config.NUM_WORKERS, collate_fn=list_data_collate
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=1, num_workers=config.NUM_WORKERS
+    )
+
+    return train_loader, val_loader, test_files
